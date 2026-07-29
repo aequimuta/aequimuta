@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         (Some("init"), None) => init(),
         (Some("validate"), None) => validate(),
         _ => {
-            eprintln!("Usage: aequimuta version");
+            eprintln!("Usage: aequimuta <command>");
             ExitCode::from(2)
         }
     }

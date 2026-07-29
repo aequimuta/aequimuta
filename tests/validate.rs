@@ -298,7 +298,7 @@ fn validate_rejects_additional_arguments_before_reading() -> TestResult {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"Usage: aequimuta version\n");
+    assert_eq!(output.stderr, b"Usage: aequimuta <command>\n");
     assert_eq!(fs::read(declaration_path)?, original_contents);
     assert_eq!(directory_entries(directory.path())?, entries_before);
 
