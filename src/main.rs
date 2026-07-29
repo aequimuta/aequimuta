@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         [command] if command == "validate" => validate(),
         [command] if command == "validate-publishing" => validate_publishing(),
         [command, service, publisher] if command == "publish" => publish(service, publisher),
+        [command, service, publisher] if command == "status" => status(service, publisher),
         _ => {
             eprintln!("Usage: aequimuta <command>");
             ExitCode::from(2)
@@ -183,6 +184,67 @@ fn publish(service_name: &str, publisher: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn status(service_name: &str, publisher: &str) -> ExitCode {
+    let declaration = match load_declaration() {
+        Ok(declaration) => declaration,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let publishing_intent = match load_publishing_intent(&declaration) {
+        Ok(publishing_intent) => publishing_intent,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let service = match declaration
+        .services
+        .iter()
+        .find(|service| service.name == service_name)
+    {
+        Some(service) => service,
+        None => {
+            eprintln!("error: selected service does not exist");
+            return ExitCode::from(1);
+        }
+    };
+
+    if !publishing_intent.publications.iter().any(|publication| {
+        publication.service == service_name && publication.publisher == publisher
+    }) {
+        eprintln!("error: selected publication is not in desired state");
+        return ExitCode::from(1);
+    }
+
+    if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
+        eprintln!("error: desired Tailscale Serve TCP publications conflict");
+        return ExitCode::from(1);
+    }
+
+    if publisher != TAILSCALE_SERVE_TCP_PUBLISHER {
+        eprintln!("error: selected publisher is not supported");
+        return ExitCode::from(1);
+    }
+
+    let relation = match tailscale_serve_tcp::observe(service.port) {
+        Ok(tailscale_serve_tcp::ProviderState::Absent) => "absent",
+        Ok(tailscale_serve_tcp::ProviderState::AlreadySatisfied) => "satisfied",
+        Ok(tailscale_serve_tcp::ProviderState::Conflict) => "conflict",
+        Ok(tailscale_serve_tcp::ProviderState::Indeterminate) => "indeterminate",
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("Publication status for {service_name} via {publisher}: {relation}");
+    ExitCode::SUCCESS
 }
 
 fn load_publishing_intent(declaration: &Declaration) -> Result<PublishingIntent, &'static str> {

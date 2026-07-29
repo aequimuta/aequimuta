@@ -22,7 +22,7 @@ pub(crate) enum EnsureOutcome {
     AlreadySatisfied { endpoint: String },
 }
 
-enum ProviderState {
+pub(crate) enum ProviderState {
     Absent,
     AlreadySatisfied,
     Conflict,
@@ -93,6 +93,12 @@ pub(crate) fn ensure(port: u16) -> Result<EnsureOutcome, String> {
         ProviderState::Indeterminate => Err(SERVE_STATE_ERROR.to_owned()),
         ProviderState::Absent => create_mapping(port, endpoint),
     }
+}
+
+pub(crate) fn observe(port: u16) -> Result<ProviderState, String> {
+    let stdout = serve_status_stdout()?;
+
+    parse_provider_state(&stdout, port).map_err(|()| SERVE_STATUS_ERROR.to_owned())
 }
 
 fn current_node_endpoint(port: u16) -> Result<String, String> {
@@ -166,6 +172,12 @@ fn ensure_local_backend_is_reachable(port: u16) -> Result<(), String> {
 }
 
 fn inspect_provider_state(port: u16) -> Result<ProviderState, String> {
+    let stdout = serve_status_stdout()?;
+
+    Ok(parse_provider_state(&stdout, port).unwrap_or(ProviderState::Indeterminate))
+}
+
+fn serve_status_stdout() -> Result<Vec<u8>, String> {
     let output = Command::new(TAILSCALE_EXECUTABLE)
         .args(["serve", "status", "--json"])
         .output()
@@ -175,7 +187,13 @@ fn inspect_provider_state(port: u16) -> Result<ProviderState, String> {
         return Err(SERVE_STATUS_ERROR.to_owned());
     }
 
-    let config: Option<ServeConfig> = match serde_json::from_slice(&output.stdout) {
+    Ok(output.stdout)
+}
+
+fn parse_provider_state(stdout: &[u8], port: u16) -> Result<ProviderState, ()> {
+    serde_json::from_slice::<Value>(stdout).map_err(|_| ())?;
+
+    let config: Option<ServeConfig> = match serde_json::from_slice(stdout) {
         Ok(config) => config,
         Err(_) => return Ok(ProviderState::Indeterminate),
     };
