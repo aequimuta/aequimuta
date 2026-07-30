@@ -1,3 +1,4 @@
+mod openssh_reverse_tcp;
 mod tailscale_serve_tcp;
 
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use tailscale_serve_tcp::EnsureOutcome;
 
 const DECLARATION_PATH: &str = "aequimuta.toml";
 const PUBLISHING_PATH: &str = "aequimuta.publish.toml";
+const OPENSSH_REVERSE_TCP_PUBLISHER: &str = "openssh-reverse-tcp";
 const TAILSCALE_SERVE_TCP_PUBLISHER: &str = "tailscale-serve-tcp";
 const INITIAL_DECLARATION: &[u8] = b"# Aequimuta service declarations\n";
 const DECLARATION_READ_ERROR: &str = "error: failed to read aequimuta.toml";
@@ -158,29 +160,72 @@ fn publish(service_name: &str, publisher: &str) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if publisher != TAILSCALE_SERVE_TCP_PUBLISHER {
-        eprintln!("error: selected publisher is not supported");
-        return ExitCode::from(1);
-    }
+    match publisher {
+        TAILSCALE_SERVE_TCP_PUBLISHER => {
+            if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
+                eprintln!("error: desired Tailscale Serve TCP publications conflict");
+                return ExitCode::from(1);
+            }
 
-    if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
-        eprintln!("error: desired Tailscale Serve TCP publications conflict");
-        return ExitCode::from(1);
-    }
-
-    match tailscale_serve_tcp::ensure(service.port) {
-        Ok(EnsureOutcome::Created { endpoint }) => {
-            println!("Published {service_name} via {publisher} at {endpoint}");
-            ExitCode::SUCCESS
+            match tailscale_serve_tcp::ensure(service.port) {
+                Ok(EnsureOutcome::Created { endpoint }) => {
+                    println!("Published {service_name} via {publisher} at {endpoint}");
+                    ExitCode::SUCCESS
+                }
+                Ok(EnsureOutcome::AlreadySatisfied { endpoint }) => {
+                    println!(
+                        "Publication already satisfied for {service_name} via {publisher} at {endpoint}"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(1)
+                }
+            }
         }
-        Ok(EnsureOutcome::AlreadySatisfied { endpoint }) => {
+        OPENSSH_REVERSE_TCP_PUBLISHER => {
+            let declared_services: Vec<&str> = declaration
+                .services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect();
+            let desired_services: Vec<&str> = publishing_intent
+                .publications
+                .iter()
+                .filter(|publication| publication.publisher == OPENSSH_REVERSE_TCP_PUBLISHER)
+                .map(|publication| publication.service.as_str())
+                .collect();
+            let publication = match openssh_reverse_tcp::load_and_resolve(
+                service_name,
+                &declared_services,
+                &desired_services,
+            ) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            if let Err(error) = openssh_reverse_tcp::ensure(service.port, &publication) {
+                eprintln!("{error}");
+                return ExitCode::from(1);
+            }
+
             println!(
-                "Publication already satisfied for {service_name} via {publisher} at {endpoint}"
+                "Ensured {service_name} via {publisher}: {}@{}:{} listen {}:{} -> 127.0.0.1:{} (SSH-session-backed; no automatic reconnect)",
+                publication.user,
+                publication.host,
+                publication.ssh_port,
+                publication.listen_address,
+                publication.listen_port,
+                service.port
             );
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!("{error}");
+        _ => {
+            eprintln!("error: selected publisher is not supported");
             ExitCode::from(1)
         }
     }
@@ -222,13 +267,13 @@ fn status(service_name: &str, publisher: &str) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
-        eprintln!("error: desired Tailscale Serve TCP publications conflict");
+    if publisher != TAILSCALE_SERVE_TCP_PUBLISHER {
+        eprintln!("error: selected publisher is not supported");
         return ExitCode::from(1);
     }
 
-    if publisher != TAILSCALE_SERVE_TCP_PUBLISHER {
-        eprintln!("error: selected publisher is not supported");
+    if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
+        eprintln!("error: desired Tailscale Serve TCP publications conflict");
         return ExitCode::from(1);
     }
 
