@@ -59,8 +59,9 @@ concerns:
 - credentials and trust
 - lifecycle and conflict behavior
 
-Changing the publishing mechanism then means rewriting both the service
-definition and its operational workflow. Aequimuta focuses on removing that
+Changing the publishing mechanism then requires reworking provider-specific
+configuration and operations even when the local
+service itself has not changed. Aequimuta focuses on removing that
 unnecessary coupling. It does not claim to solve every networking, routing, or
 credential problem.
 
