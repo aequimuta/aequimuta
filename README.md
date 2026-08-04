@@ -2,17 +2,15 @@
 
 > **Declare the service once. Change the publisher, not the service.**
 
-Aequimuta is a CLI that publishes local TCP services through interchangeable
+Aequimuta is a CLI for publishing local TCP services through concrete
 mechanisms such as Tailscale Serve and OpenSSH reverse forwarding—without
-changing the service declaration.
+coupling the service declaration to either one.
 
-In Aequimuta, a publisher is a concrete mechanism that exposes a local service,
-such as Tailscale Serve or OpenSSH reverse forwarding. A publisher is selected
-by its exact capability token; Aequimuta does not currently have a plugin system
-or generic Publisher API.
+In Aequimuta, a publisher is the concrete mechanism used to expose a local
+service.
 
-Aequimuta keeps the service definition neutral without pretending that
-different publishing mechanisms have identical lifecycle or status semantics.
+Aequimuta keeps the service definition neutral while preserving each
+publisher's actual lifecycle, visibility, and status semantics.
 
 ## 30-second proof
 
@@ -93,8 +91,7 @@ registry, reconciliation engine, ownership database, or runtime daemon.
 Aequimuta currently supports exactly two operational publisher tokens:
 
 - `tailscale-serve-tcp` — tailnet-private Tailscale Serve raw TCP forwarding
-- `openssh-reverse-tcp` — fixed OpenSSH remote TCP forwarding backed by a
-  dedicated background SSH ControlMaster session
+- `openssh-reverse-tcp` — fixed OpenSSH remote TCP forwarding
 
 The current commands are:
 
@@ -253,11 +250,11 @@ The current safety boundaries include:
 - operational rejection of unsupported publisher tokens
 - rejection of ambiguous desired provider slots
 - no overwrite of incompatible existing provider state
-- fail-closed treatment of provider state that cannot be interpreted safely
+- fail-closed treatment of provider state that cannot be interpreted safely;
+  unknown state is not treated as absent
 - Tailscale post-condition verification after creation
 - OpenSSH server acknowledgement before an `Ensured` result
 - no broad provider reset or automatic takeover
-- no assumption that an unknown state is absent
 - no modification of project TOML files by `publish` or `status`
 - no secret fields in the Git-trackable OpenSSH provider configuration
 
@@ -273,9 +270,8 @@ ownership record or authoritative remote snapshot.
 - no project-wide apply or reconciliation
 - no unpublish or delete command
 - no durable ownership database
-- OpenSSH status unsupported
-- OpenSSH automatic reconnect unsupported
-- OpenSSH reboot persistence unsupported
+- OpenSSH has no authoritative status, automatic reconnect, or reboot
+  persistence
 - no generic Publisher plugin API
 - no third publisher
 - no HTTP, HTTPS, or UDP publishing capability

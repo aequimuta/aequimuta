@@ -10,6 +10,9 @@
 Aequimuta is designed around a narrow boundary: describe a local service
 without embedding the mechanism that exposes it.
 
+> **Neutrality applies to the service declaration, not to the operational
+> semantics of every publisher.**
+
 The current goals are:
 
 - keep the service declaration stable and publisher-neutral
@@ -37,9 +40,10 @@ A provider-specific publishing workflow often combines all of the following:
 - process or provider lifetime
 - collision and replacement behavior
 
-That combination makes the provider part of the service definition. Replacing
-the provider then requires redefining the service and rebuilding its operating
-workflow.
+That combination couples provider-specific concerns to the service's
+operational definition and workflow. Replacing the provider then requires
+changing publishing configuration and operations even when the local service
+itself has not changed.
 
 Aequimuta separates the stable service identity from the concrete publication
 mechanism. It does not erase the operational differences that remain.
