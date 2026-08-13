@@ -81,8 +81,8 @@ publisher = "openssh-reverse-tcp"
 
 Each entry is an exact `(service, publisher)` relation. The same service may
 select both current publishers. The file contains desired intent, not observed
-provider state, credentials, ownership, or a request to apply every entry at
-once.
+provider state, credentials, or ownership. `aequimuta apply` consumes all of
+its entries as a project-wide one-shot ensure operation in declaration order.
 
 ### 3. Provider-specific configuration and runtime effects
 
@@ -127,9 +127,10 @@ The publishing intent schema is also small:
 - unknown root and publication fields are rejected
 
 Lexically valid publisher tokens are not proof of runtime support.
-`validate-publishing` checks syntax and service relationships; `publish` or
-`status` rejects unsupported operational tokens. This keeps parsing a desired
-intent separate from dispatching a concrete mechanism.
+`validate-publishing` checks syntax and service relationships; `publish`,
+`status`, or `apply` rejects unsupported operational tokens. In particular,
+`apply` checks every desired token before any provider mutation. This keeps
+parsing a desired intent separate from dispatching a concrete mechanism.
 
 ## Concrete provider configuration and runtime effects
 
@@ -148,6 +149,47 @@ to the local Tailscale environment rather than to an Aequimuta process.
 
 These runtime effects differ because the providers differ. No hidden runtime
 state database is used to make them appear identical.
+
+## Project-wide one-shot apply
+
+`aequimuta apply` takes no arguments. It processes the current entries in
+`aequimuta.publish.toml` once; it does not start a daemon or a persistent
+desired/actual convergence loop.
+
+Execution has two safety phases. Phase A performs project and static preflight
+before provider mutation:
+
+- validate `aequimuta.toml` and `aequimuta.publish.toml`
+- require every desired publisher token to be operationally supported
+- check Tailscale same-port ambiguity only with the Tailscale collision rule
+- when OpenSSH is desired, load its strict provider file, resolve every active
+  service configuration, and check OpenSSH remote-slot ambiguity with the
+  OpenSSH collision rule
+- check TCP reachability for each unique desired local backend
+- when OpenSSH is desired, validate and prepare its owner-only XDG runtime
+  directory without starting an SSH process or requesting a forwarding
+
+An OpenSSH provider file is not read when there is no desired OpenSSH
+publication. Any failure listed above stops the command before a concrete
+provider can mutate state.
+
+After Phase A succeeds, Phase B ensures entries sequentially in their exact
+declaration order. It does not sort or run entries in parallel. Each entry uses
+the same concrete provider operation as individual `publish`, including its
+provider-specific success meaning and output: Tailscale reports **Created** or
+**Already satisfied**, while OpenSSH reports **Ensured**. A fully successful
+run ends with `Applied <N> desired publications`.
+
+A valid publishing intent with no entries is a successful no-op and reports
+`No desired publications to apply`. If a runtime provider operation fails,
+`apply` stops immediately, does not execute later entries, and does not print
+the final summary. Earlier successful output and effects remain and are not
+rolled back. The command is not an atomic or transactional cross-provider
+operation.
+
+`apply` ensures only the entries currently declared. It does not inspect or
+delete unrelated provider resources, remove resources for entries absent from
+the project, infer ownership, or write a project runtime database.
 
 ## Neutrality without false equivalence
 
@@ -194,8 +236,9 @@ OpenSSH currently has no equivalent authoritative observed relation. Checking
 that a local multiplexed SSH master is alive while publishing is not the same
 as obtaining a non-mutating snapshot of exact remote forwarding state.
 
-Aequimuta does not currently run a universal reconciliation loop or infer that
-every desired entry has been applied.
+Aequimuta does not run a universal reconciliation loop or infer current
+provider state from an earlier `apply`. Each invocation performs only the
+one-shot checks and ensures described above.
 
 ## Safety and non-destructive behavior
 
@@ -203,6 +246,8 @@ The current safety model is based on exact identity and refusal:
 
 - parse known TOML fields strictly
 - select exact, case-sensitive service and publisher identities
+- validate all project-wide static and applicability conditions before `apply`
+  begins provider mutation
 - reject ambiguous desired provider slots before mutation
 - reject unsupported operational publisher tokens
 - classify unknown Tailscale state as indeterminate rather than absent
@@ -210,8 +255,8 @@ The current safety model is based on exact identity and refusal:
 - verify the exact Tailscale post-condition after creation
 - require OpenSSH forwarding acknowledgement before success
 - avoid broad reset, cleanup, takeover, or false ownership claims
-- preserve project TOML bytes and project directory entries during `publish`
-  and `status`
+- preserve project TOML bytes and project directory entries during `publish`,
+  `status`, and `apply`
 
 Tailscale state can still change between Aequimuta's observation and provider
 mutation. The current implementation assumes a single writer during that
@@ -266,7 +311,9 @@ See the [OpenSSH reverse TCP guide](providers/openssh-reverse-tcp.md).
 The current design does not provide:
 
 - a generic Publisher plugin framework
-- project-wide apply, reconciliation, or lifecycle management
+- a background controller or persistent desired/actual convergence loop
+- automatic deletion of resources absent from desired publications
+- rollback, cross-provider atomicity, or transactional lifecycle management
 - ownership or provenance inference for existing provider resources
 - cross-provider cutover, continuity guarantees, or conflict resolution
 - credential or secret storage in project files
@@ -278,6 +325,7 @@ The current design does not provide:
 - only local TCP services are modeled
 - both current backends are fixed to IPv4 loopback
 - one exact publication is selected per `publish` or `status` command
+- `apply` is sequential and one-shot, with no rollback of earlier successes
 - there is no unpublish or delete command
 - there is no durable ownership or runtime database
 - status exists only for Tailscale Serve TCP

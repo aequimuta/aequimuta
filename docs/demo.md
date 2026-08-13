@@ -24,8 +24,8 @@ The walkthrough demonstrates that:
 - Tailscale and OpenSSH retain different outcomes, status, visibility, and
   lifetime semantics
 
-It does not demonstrate coordinated cutover, project-wide reconciliation, or
-public Internet reachability.
+It does not demonstrate coordinated cutover, a background convergence loop,
+removal of undeclared provider resources, or public Internet reachability.
 
 ## Prerequisites
 
@@ -49,9 +49,10 @@ Prepare both provider environments:
 The example data-path checks use `python3` as a demo-only TCP backend and
 `curl` as its client. Equivalent TCP-capable tools can be used instead.
 
-Use only ports and remote listeners you are authorized to configure. The two
-publishing paths are independent, so you can demonstrate either one alone if
-the other provider is unavailable.
+Use only ports and remote listeners you are authorized to configure. The
+project-wide `apply` demonstration requires both provider environments. The two
+publishing paths remain independent, so you can instead demonstrate either one
+with its individual `publish` command if the other provider is unavailable.
 
 ## 1. Start one local service
 
@@ -131,20 +132,62 @@ aequimuta validate-publishing
 ```
 
 The second command does not validate the OpenSSH-specific file. That file is
-validated when the OpenSSH publish path is selected.
+validated by an individual OpenSSH publish, or during project-wide preflight
+when `apply` finds at least one desired OpenSSH publication.
 
-## 6. Publish through Tailscale
+## 6. Apply all desired publications once
 
-Run:
+Run the zero-argument project-wide operation:
+
+```sh
+aequimuta apply
+```
+
+Before any provider mutation, Phase A validates the project, operational
+publisher support, both provider-specific ambiguity rules, the required
+OpenSSH configuration, and TCP reachability of the unique local backend. It
+also checks the owner-only OpenSSH XDG runtime directory without starting an
+SSH process or requesting a forwarding. Phase B then ensures the two entries
+sequentially in the exact order written in `aequimuta.publish.toml`.
+
+With an absent Tailscale slot and a successful OpenSSH forwarding request, the
+output has this shape:
+
+```text
+Published web via tailscale-serve-tcp at tcp://<tailscale-dns-name>:8080
+Ensured web via openssh-reverse-tcp: aequimuta@edge.example.com:22 listen 0.0.0.0:18080 -> 127.0.0.1:8080 (SSH-session-backed; no automatic reconnect)
+Applied 2 desired publications
+```
+
+The first line is Tailscale's **Created** outcome; an exact pre-existing mapping
+would instead produce its **Already satisfied** line. OpenSSH continues to
+report **Ensured** rather than adopting those Tailscale outcome labels.
+
+A valid publishing intent with zero entries is also successful and prints only
+`No desired publications to apply`. If a runtime provider operation fails,
+`apply` stops before later entries and omits the final summary. Earlier
+successful effects are not rolled back.
+
+## 7. Publish through Tailscale individually
+
+The exact individual operation remains available:
 
 ```sh
 aequimuta publish web tailscale-serve-tcp
 ```
 
-For an absent selected slot, the output has this shape:
+If this command is used instead of Step 6 with an absent selected slot, its
+Created output has this shape:
 
 ```text
 Published web via tailscale-serve-tcp at tcp://<tailscale-dns-name>:8080
+```
+
+After Step 6, the same individual command reports the distinct
+Already-satisfied outcome:
+
+```text
+Publication already satisfied for web via tailscale-serve-tcp at tcp://<tailscale-dns-name>:8080
 ```
 
 The returned endpoint identifies the current tailnet-private raw TCP mapping.
@@ -158,7 +201,7 @@ curl http://<tailscale-dns-name>:8080/
 This check depends on the client being able to resolve and reach the tailnet
 endpoint.
 
-## 7. Observe Tailscale status
+## 8. Observe Tailscale status
 
 Run:
 
@@ -176,9 +219,10 @@ This observes the provider mapping only. Stop the Python backend and the mapping
 can still be `satisfied`; status is not a local health check. Restart the backend
 before continuing because both publish paths preflight local TCP connectivity.
 
-## 8. Publish through OpenSSH
+## 9. Publish through OpenSSH individually
 
-With the configured remote server ready, run:
+The exact individual operation also remains available. With the configured
+remote server ready, run:
 
 ```sh
 aequimuta publish web openssh-reverse-tcp
@@ -194,7 +238,7 @@ This means the current background SSH session received acknowledgement for the
 requested forwarding. It does not mean the listener is publicly reachable or
 that the server preserved the requested bind address exactly.
 
-## 9. Verify the OpenSSH TCP data path
+## 10. Verify the OpenSSH TCP data path
 
 From a location that remote SSH policy, routing, and firewall rules allow to
 reach the listener, request the demo backend through the remote address:
@@ -207,30 +251,28 @@ Choose `<reachable-remote-address>` from observed server and network behavior,
 not merely from `listen_address`. A request for `0.0.0.0` does not configure DNS,
 open a firewall, traverse NAT, or guarantee Internet reachability.
 
-## 10. Repeat publish
+## 11. Repeat apply
 
-Repeat Tailscale publication:
+Run the same project-wide operation again:
 
 ```sh
-aequimuta publish web tailscale-serve-tcp
+aequimuta apply
 ```
 
-With the exact mapping already present, it reports the distinct
-Already-satisfied outcome:
+With the exact Tailscale mapping and valid OpenSSH session already present, the
+output keeps each provider's concrete meaning and ends with a new completed-run
+summary:
 
 ```text
 Publication already satisfied for web via tailscale-serve-tcp at tcp://<tailscale-dns-name>:8080
+Ensured web via openssh-reverse-tcp: aequimuta@edge.example.com:22 listen 0.0.0.0:18080 -> 127.0.0.1:8080 (SSH-session-backed; no automatic reconnect)
+Applied 2 desired publications
 ```
 
-Repeat OpenSSH publication:
-
-```sh
-aequimuta publish web openssh-reverse-tcp
-```
-
-It reuses the valid destination-specific ControlMaster and requests the exact
-forward again. The outcome remains `Ensured`; it does not claim Created or
-Already satisfied.
+Tailscale performs no duplicate mutation for the already-satisfied mapping.
+OpenSSH reuses the valid destination-specific ControlMaster and requests the
+exact forward again. Its outcome remains `Ensured`; it does not claim Created
+or Already satisfied.
 
 ## What changed and what did not
 
@@ -241,9 +283,10 @@ Unchanged:
 - local port `8080`
 - local backend `127.0.0.1:8080`
 
-Changed by selection:
+Chosen outside the service declaration:
 
-- the exact publisher token passed to `publish`
+- the declaration-ordered publishing intents consumed by `apply`
+- the exact publisher token passed to an individual `publish`
 - the concrete provider operation
 - provider-specific configuration requirements
 - visibility and endpoint meaning
@@ -254,15 +297,22 @@ the mechanism remains concrete.
 
 ## Safety notes
 
-- Aequimuta selects one exact desired `(service, publisher)` relation per
-  command.
+- Individual `publish` and `status` commands select one exact desired
+  `(service, publisher)` relation. `apply` consumes every desired relation once
+  in declaration order.
+- `apply` completes project/static preflight before provider mutation and then
+  executes provider operations sequentially.
 - It does not overwrite a conflicting Tailscale slot or an occupied OpenSSH
   listener.
 - It does not treat unknown provider state as absent.
 - The Tailscale create path verifies its post-condition.
 - The OpenSSH path waits for forwarding acknowledgement.
-- Project TOML files are not modified by `publish` or `status`.
+- Project TOML files are not modified by `publish`, `status`, or `apply`.
 - Neither path provides an absolute transaction or concurrent-writer guarantee.
+- A failed `apply` does not roll back earlier successes or execute later
+  entries.
+- `apply` does not delete resources absent from the desired entries and does
+  not run continuously in the background.
 
 ## Cleanup limitations
 

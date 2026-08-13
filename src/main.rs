@@ -1,3 +1,4 @@
+mod local_tcp_backend;
 mod openssh_reverse_tcp;
 mod tailscale_serve_tcp;
 
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
         [command] if command == "init" => init(),
         [command] if command == "validate" => validate(),
         [command] if command == "validate-publishing" => validate_publishing(),
+        [command] if command == "apply" => apply(),
         [command, service, publisher] if command == "publish" => publish(service, publisher),
         [command, service, publisher] if command == "status" => status(service, publisher),
         _ => {
@@ -167,15 +169,9 @@ fn publish(service_name: &str, publisher: &str) -> ExitCode {
                 return ExitCode::from(1);
             }
 
-            match tailscale_serve_tcp::ensure(service.port) {
-                Ok(EnsureOutcome::Created { endpoint }) => {
-                    println!("Published {service_name} via {publisher} at {endpoint}");
-                    ExitCode::SUCCESS
-                }
-                Ok(EnsureOutcome::AlreadySatisfied { endpoint }) => {
-                    println!(
-                        "Publication already satisfied for {service_name} via {publisher} at {endpoint}"
-                    );
+            match ensure_tailscale_publication(service_name, service.port) {
+                Ok(success) => {
+                    println!("{success}");
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -208,27 +204,218 @@ fn publish(service_name: &str, publisher: &str) -> ExitCode {
                 }
             };
 
-            if let Err(error) = openssh_reverse_tcp::ensure(service.port, &publication) {
-                eprintln!("{error}");
-                return ExitCode::from(1);
+            match ensure_openssh_publication(service_name, service.port, &publication) {
+                Ok(success) => {
+                    println!("{success}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(1)
+                }
             }
-
-            println!(
-                "Ensured {service_name} via {publisher}: {}@{}:{} listen {}:{} -> 127.0.0.1:{} (SSH-session-backed; no automatic reconnect)",
-                publication.user,
-                publication.host,
-                publication.ssh_port,
-                publication.listen_address,
-                publication.listen_port,
-                service.port
-            );
-            ExitCode::SUCCESS
         }
         _ => {
             eprintln!("error: selected publisher is not supported");
             ExitCode::from(1)
         }
     }
+}
+
+fn apply() -> ExitCode {
+    let declaration = match load_declaration() {
+        Ok(declaration) => declaration,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let publishing_intent = match load_publishing_intent(&declaration) {
+        Ok(publishing_intent) => publishing_intent,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if publishing_intent
+        .publications
+        .iter()
+        .any(|publication| !publisher_is_operationally_supported(&publication.publisher))
+    {
+        eprintln!("error: desired publisher is not supported");
+        return ExitCode::from(1);
+    }
+
+    if tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent) {
+        eprintln!("error: desired Tailscale Serve TCP publications conflict");
+        return ExitCode::from(1);
+    }
+
+    let declared_services: Vec<&str> = declaration
+        .services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
+    let desired_openssh_services: Vec<&str> = publishing_intent
+        .publications
+        .iter()
+        .filter(|publication| publication.publisher == OPENSSH_REVERSE_TCP_PUBLISHER)
+        .map(|publication| publication.service.as_str())
+        .collect();
+    let resolved_openssh = if desired_openssh_services.is_empty() {
+        None
+    } else {
+        match openssh_reverse_tcp::load_and_resolve_desired(
+            &declared_services,
+            &desired_openssh_services,
+        ) {
+            Ok(publications) => Some(publications),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    let services_by_name: HashMap<&str, &Service> = declaration
+        .services
+        .iter()
+        .map(|service| (service.name.as_str(), service))
+        .collect();
+    let mut checked_backends = HashSet::new();
+
+    for publication in &publishing_intent.publications {
+        let Some(service) = services_by_name.get(publication.service.as_str()) else {
+            eprintln!("{INVALID_PUBLISHING_ERROR}");
+            return ExitCode::from(1);
+        };
+
+        if checked_backends.insert(service.port)
+            && let Err(error) = local_tcp_backend::ensure_reachable(service.port)
+        {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    if resolved_openssh.is_some()
+        && let Err(error) = openssh_reverse_tcp::preflight_runtime()
+    {
+        eprintln!("{error}");
+        return ExitCode::from(1);
+    }
+
+    if publishing_intent.publications.is_empty() {
+        println!("No desired publications to apply");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut successful_publications = 0_usize;
+
+    for publication in &publishing_intent.publications {
+        let Some(service) = services_by_name.get(publication.service.as_str()) else {
+            eprintln!("{INVALID_PUBLISHING_ERROR}");
+            return ExitCode::from(1);
+        };
+        let result = match publication.publisher.as_str() {
+            TAILSCALE_SERVE_TCP_PUBLISHER => {
+                ensure_tailscale_publication(&publication.service, service.port)
+            }
+            OPENSSH_REVERSE_TCP_PUBLISHER => resolved_openssh
+                .as_ref()
+                .ok_or_else(|| {
+                    "error: desired OpenSSH reverse TCP publication has no provider configuration"
+                        .to_owned()
+                })
+                .and_then(|publications| publications.get(&publication.service))
+                .and_then(|provider_publication| {
+                    ensure_openssh_publication(
+                        &publication.service,
+                        service.port,
+                        provider_publication,
+                    )
+                }),
+            _ => Err("error: desired publisher is not supported".to_owned()),
+        };
+
+        match result {
+            Ok(success) => {
+                println!("{success}");
+                successful_publications += 1;
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    contextual_apply_error(
+                        &publication.service,
+                        &publication.publisher,
+                        &error,
+                        successful_publications,
+                    )
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    println!(
+        "Applied {} desired publications",
+        publishing_intent.publications.len()
+    );
+    ExitCode::SUCCESS
+}
+
+fn publisher_is_operationally_supported(publisher: &str) -> bool {
+    matches!(
+        publisher,
+        TAILSCALE_SERVE_TCP_PUBLISHER | OPENSSH_REVERSE_TCP_PUBLISHER
+    )
+}
+
+fn ensure_tailscale_publication(service_name: &str, port: u16) -> Result<String, String> {
+    match tailscale_serve_tcp::ensure(port)? {
+        EnsureOutcome::Created { endpoint } => Ok(format!(
+            "Published {service_name} via {TAILSCALE_SERVE_TCP_PUBLISHER} at {endpoint}"
+        )),
+        EnsureOutcome::AlreadySatisfied { endpoint } => Ok(format!(
+            "Publication already satisfied for {service_name} via {TAILSCALE_SERVE_TCP_PUBLISHER} at {endpoint}"
+        )),
+    }
+}
+
+fn ensure_openssh_publication(
+    service_name: &str,
+    local_port: u16,
+    publication: &openssh_reverse_tcp::ProviderPublication,
+) -> Result<String, String> {
+    openssh_reverse_tcp::ensure(local_port, publication)?;
+
+    Ok(format!(
+        "Ensured {service_name} via {OPENSSH_REVERSE_TCP_PUBLISHER}: {}@{}:{} listen {}:{} -> 127.0.0.1:{local_port} (SSH-session-backed; no automatic reconnect)",
+        publication.user,
+        publication.host,
+        publication.ssh_port,
+        publication.listen_address,
+        publication.listen_port,
+    ))
+}
+
+fn contextual_apply_error(
+    service: &str,
+    publisher: &str,
+    error: &str,
+    successful_publications: usize,
+) -> String {
+    let detail = error.strip_prefix("error: ").unwrap_or(error);
+    let rollback_context = if successful_publications == 0 {
+        ""
+    } else {
+        "; earlier successful publications were not rolled back"
+    };
+
+    format!("error: apply failed for {service} via {publisher}: {detail}{rollback_context}")
 }
 
 fn status(service_name: &str, publisher: &str) -> ExitCode {

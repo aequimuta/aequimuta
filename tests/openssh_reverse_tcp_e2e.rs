@@ -450,11 +450,88 @@ impl Fixture {
         Ok(())
     }
 
+    fn exercise_apply(&mut self) -> TestResult {
+        fs::write(
+            self.project.join(PUBLISHING_FILE),
+            format!("[[publications]]\nservice = \"web\"\npublisher = \"{PUBLISHER}\"\n"),
+        )?;
+        let snapshot = ProjectSnapshot::capture(&self.project)?;
+        let success_stdout = format!(
+            "Ensured web via {PUBLISHER}: {}@127.0.0.1:{} listen 127.0.0.1:{} -> 127.0.0.1:{} (SSH-session-backed; no automatic reconnect)\nApplied 1 desired publications\n",
+            self.username,
+            self.sshd_port,
+            self.success_listener_port,
+            self.web_backend.port()
+        );
+
+        let first = self.apply()?;
+        if !first.status.success() {
+            return Err(io::Error::other(format!(
+                "initial apply failed: {first:?}; client log: {}; sshd log: {}",
+                read_diagnostic(&self.client_log),
+                read_diagnostic(&self.sshd_log)
+            ))
+            .into());
+        }
+        assert_success(&first, success_stdout.as_bytes(), "initial apply")?;
+        snapshot.assert_unchanged()?;
+
+        let control_path = self.find_control_path()?;
+        self.control_path = Some(control_path.clone());
+        validate_runtime_state(&self.runtime, &control_path)?;
+        let master_before_repeat = check_master(&control_path)?;
+        check(
+            count_control_sockets(&self.runtime)? == 1,
+            "initial apply did not create exactly one control socket",
+        )?;
+        wait_for_listener_count(self.success_listener_port, 1)?;
+        round_trip(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, self.success_listener_port)),
+            b"openssh-apply-e2e-initial-nonce",
+        )?;
+
+        let repeated = self.apply()?;
+        assert_success(&repeated, success_stdout.as_bytes(), "repeat apply")?;
+        snapshot.assert_unchanged()?;
+        check(
+            check_master(&control_path)? == master_before_repeat,
+            "repeat apply replaced the dedicated ControlMaster",
+        )?;
+        check(
+            count_control_sockets(&self.runtime)? == 1,
+            "repeat apply created another control socket",
+        )?;
+        wait_for_listener_count(self.success_listener_port, 1)?;
+        round_trip(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, self.success_listener_port)),
+            b"openssh-apply-e2e-repeat-nonce",
+        )?;
+        self.sshd.ensure_running()?;
+
+        Ok(())
+    }
+
     fn publish(&self, service: &str) -> io::Result<Output> {
         Command::new(env!("CARGO_BIN_EXE_aequimuta"))
             .arg("publish")
             .arg(service)
             .arg(PUBLISHER)
+            .current_dir(&self.project)
+            .env("PATH", &self.wrapper_directory)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("HOME", &self.home)
+            .env("LC_ALL", "C")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_AGENT_PID")
+            .env_remove("SSH_ASKPASS")
+            .env_remove("SSH_ASKPASS_REQUIRE")
+            .env_remove("DISPLAY")
+            .output()
+    }
+
+    fn apply(&self) -> io::Result<Output> {
+        Command::new(env!("CARGO_BIN_EXE_aequimuta"))
+            .arg("apply")
             .current_dir(&self.project)
             .env("PATH", &self.wrapper_directory)
             .env("XDG_RUNTIME_DIR", &self.runtime)
@@ -1040,7 +1117,10 @@ fn check(condition: bool, message: impl Into<String>) -> io::Result<()> {
 #[test]
 fn openssh_reverse_tcp_real_session_lifecycle_is_non_destructive() -> TestResult {
     let mut fixture = Fixture::start()?;
-    let exercise_result = fixture.exercise();
+    let exercise_result = match fixture.exercise() {
+        Ok(()) => fixture.exercise_apply(),
+        Err(error) => Err(error),
+    };
     let cleanup_result = fixture.cleanup();
 
     match (exercise_result, cleanup_result) {

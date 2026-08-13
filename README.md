@@ -103,6 +103,7 @@ aequimuta validate
 aequimuta validate-publishing
 aequimuta publish <service> <publisher>
 aequimuta status <service> <publisher>
+aequimuta apply
 ```
 
 `status` currently supports only `tailscale-serve-tcp`. OpenSSH publication has
@@ -178,8 +179,10 @@ aequimuta validate-publishing
 
 `validate-publishing` checks publisher token syntax, service references, and
 exact tuple duplicates. It does not validate whether a token is operationally
-supported, provider-specific conflicts, or the OpenSSH configuration file. The
-selected OpenSSH publish path validates that file when it runs.
+supported, provider-specific conflicts, or the OpenSSH configuration file.
+Individual operations validate the selected concrete path when they run.
+`apply` performs operational and provider-specific project preflight for every
+desired publication before beginning provider mutation.
 
 ### Publish with Tailscale
 
@@ -220,6 +223,45 @@ OpenSSH credentials and strict host-key trust must already be available in the
 machine-local OpenSSH environment. Aequimuta does not accept credentials in the
 project files.
 
+### Apply all desired publications once
+
+With every desired backend and provider prerequisite ready, run the
+zero-argument project-wide command:
+
+```sh
+aequimuta apply
+```
+
+`apply` first validates the whole project, including operational publisher
+support, provider-specific desired-slot ambiguity, the OpenSSH configuration
+when an OpenSSH publication is present, and TCP reachability of every unique
+local backend. It also checks the OpenSSH XDG runtime directory safety when
+OpenSSH is desired. A failure in this phase occurs before any provider
+mutation.
+
+After that preflight succeeds, Aequimuta ensures each entry from
+`aequimuta.publish.toml` once, sequentially and in declaration order. It uses
+the same concrete operations as individual `publish` commands, so Tailscale
+still reports either **Created** or **Already satisfied**, while OpenSSH reports
+**Ensured**. After all entries succeed, the final line is:
+
+```text
+Applied <N> desired publications
+```
+
+An empty, valid publishing intent is a successful no-op with exact output:
+
+```text
+No desired publications to apply
+```
+
+If a provider operation fails after preflight, `apply` stops at that entry and
+does not run later entries or print the final summary. Output and effects from
+earlier successful entries remain; Aequimuta does not roll them back. This is a
+one-shot ensure operation, not a transaction or a background convergence loop,
+and it does not delete provider resources that are absent from the desired
+entries.
+
 ## Publisher comparison
 
 | Property | `tailscale-serve-tcp` | `openssh-reverse-tcp` |
@@ -250,13 +292,16 @@ The current safety boundaries include:
 - strict TOML schemas and unknown-field rejection
 - operational rejection of unsupported publisher tokens
 - rejection of ambiguous desired provider slots
+- project-wide static and backend preflight before `apply` begins provider
+  mutation
+- declaration-order, sequential execution by `apply`
 - no overwrite of incompatible existing provider state
 - fail-closed treatment of provider state that cannot be interpreted safely;
   unknown state is not treated as absent
 - Tailscale post-condition verification after creation
 - OpenSSH server acknowledgement before an `Ensured` result
 - no broad provider reset or automatic takeover
-- no modification of project TOML files by `publish` or `status`
+- no modification of project TOML files by `publish`, `status`, or `apply`
 - no secret fields in the Git-trackable OpenSSH provider configuration
 
 These boundaries are not an absolute transaction or concurrency guarantee.
@@ -268,7 +313,9 @@ ownership record or authoritative remote snapshot.
 
 - TCP services only
 - local backend fixed to `127.0.0.1:<service.port>`
-- no project-wide apply or reconciliation
+- no background controller or continuous desired/actual convergence loop
+- no rollback transaction or cross-provider atomicity for `apply`
+- no deletion of resources absent from the desired publications
 - no unpublish or delete command
 - no durable ownership database
 - OpenSSH has no authoritative status, automatic reconnect, or reboot

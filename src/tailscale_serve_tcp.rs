@@ -2,9 +2,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
-use std::time::Duration;
+
+use crate::local_tcp_backend;
 
 const TAILSCALE_EXECUTABLE: &str = "tailscale";
 const EXECUTABLE_ERROR: &str = "error: tailscale executable is not available";
@@ -85,7 +85,7 @@ struct TcpPortHandler {
 
 pub(crate) fn ensure(port: u16) -> Result<EnsureOutcome, String> {
     let endpoint = current_node_endpoint(port)?;
-    ensure_local_backend_is_reachable(port)?;
+    local_tcp_backend::ensure_reachable(port)?;
 
     match inspect_provider_state(port)? {
         ProviderState::AlreadySatisfied => Ok(EnsureOutcome::AlreadySatisfied { endpoint }),
@@ -161,14 +161,6 @@ fn dns_name_is_valid(dns_name: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
-}
-
-fn ensure_local_backend_is_reachable(port: u16) -> Result<(), String> {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-
-    TcpStream::connect_timeout(&address, Duration::from_secs(1))
-        .map(|_| ())
-        .map_err(|_| format!("error: local TCP backend 127.0.0.1:{port} is not reachable"))
 }
 
 fn inspect_provider_state(port: u16) -> Result<ProviderState, String> {

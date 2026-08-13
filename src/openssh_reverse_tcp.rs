@@ -4,13 +4,15 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::Ipv4Addr;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::local_tcp_backend;
 
 const CONFIGURATION_PATH: &str = "aequimuta.openssh-reverse-tcp.toml";
 const SSH_EXECUTABLE: &str = "ssh";
@@ -60,11 +62,33 @@ pub(crate) struct ProviderPublication {
     pub(crate) listen_port: u16,
 }
 
+pub(crate) struct ResolvedPublications {
+    active: Vec<ProviderPublication>,
+}
+
+impl ResolvedPublications {
+    pub(crate) fn get(&self, service: &str) -> Result<&ProviderPublication, String> {
+        self.active
+            .iter()
+            .find(|publication| publication.service == service)
+            .ok_or_else(|| CONFIGURATION_RESOLUTION_ERROR.to_owned())
+    }
+}
+
 pub(crate) fn load_and_resolve(
     selected_service: &str,
     declared_services: &[&str],
     desired_services: &[&str],
 ) -> Result<ProviderPublication, String> {
+    let resolved = load_and_resolve_desired(declared_services, desired_services)?;
+
+    resolved.get(selected_service).cloned()
+}
+
+pub(crate) fn load_and_resolve_desired(
+    declared_services: &[&str],
+    desired_services: &[&str],
+) -> Result<ResolvedPublications, String> {
     let bytes = fs::read(CONFIGURATION_PATH).map_err(|_| CONFIGURATION_READ_ERROR.to_owned())?;
     let source = std::str::from_utf8(&bytes).map_err(|_| CONFIGURATION_UTF8_ERROR.to_owned())?;
     let configuration: ProviderConfiguration =
@@ -72,22 +96,26 @@ pub(crate) fn load_and_resolve(
     let declared_services: HashSet<&str> = declared_services.iter().copied().collect();
     let mut by_service = HashMap::with_capacity(configuration.publications.len());
 
-    for publication in &configuration.publications {
-        if !provider_publication_is_valid(publication)
+    for publication in configuration.publications {
+        if !provider_publication_is_valid(&publication)
             || !declared_services.contains(publication.service.as_str())
-            || by_service
-                .insert(publication.service.as_str(), publication)
-                .is_some()
         {
+            return Err(INVALID_CONFIGURATION_ERROR.to_owned());
+        }
+
+        let service = publication.service.clone();
+
+        if by_service.insert(service, publication).is_some() {
             return Err(INVALID_CONFIGURATION_ERROR.to_owned());
         }
     }
 
     let mut remote_slots = HashSet::with_capacity(desired_services.len());
+    let mut active = Vec::with_capacity(desired_services.len());
 
     for desired_service in desired_services {
         let publication = by_service
-            .get(desired_service)
+            .get(*desired_service)
             .ok_or_else(|| CONFIGURATION_RESOLUTION_ERROR.to_owned())?;
         let remote_slot = (
             publication.host.as_str(),
@@ -99,17 +127,21 @@ pub(crate) fn load_and_resolve(
         if !remote_slots.insert(remote_slot) {
             return Err(DESIRED_SLOT_CONFLICT_ERROR.to_owned());
         }
+
+        active.push(publication.clone());
     }
 
-    by_service
-        .get(selected_service)
-        .copied()
-        .cloned()
-        .ok_or_else(|| CONFIGURATION_RESOLUTION_ERROR.to_owned())
+    Ok(ResolvedPublications { active })
+}
+
+pub(crate) fn preflight_runtime() -> Result<(), String> {
+    let current_uid = current_uid()?;
+    prepare_runtime_directory(current_uid)?;
+    Ok(())
 }
 
 pub(crate) fn ensure(local_port: u16, publication: &ProviderPublication) -> Result<(), String> {
-    ensure_local_backend_is_reachable(local_port)?;
+    local_tcp_backend::ensure_reachable(local_port)?;
 
     let current_uid = current_uid()?;
     let runtime_directory = prepare_runtime_directory(current_uid)?;
@@ -186,14 +218,6 @@ fn host_is_valid(host: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
-}
-
-fn ensure_local_backend_is_reachable(port: u16) -> Result<(), String> {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-
-    TcpStream::connect_timeout(&address, Duration::from_secs(1))
-        .map(|_| ())
-        .map_err(|_| format!("error: local TCP backend 127.0.0.1:{port} is not reachable"))
 }
 
 fn current_uid() -> Result<u32, String> {
