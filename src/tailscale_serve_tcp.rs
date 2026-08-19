@@ -96,12 +96,29 @@ pub(crate) fn ensure(port: u16) -> Result<EnsureOutcome, String> {
 }
 
 pub(crate) fn observe(port: u16) -> Result<ProviderState, String> {
+    observe_ports(&[port])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| SERVE_STATUS_ERROR.to_owned())
+}
+
+pub(crate) fn observe_ports(ports: &[u16]) -> Result<Vec<ProviderState>, String> {
     let stdout = serve_status_stdout()?;
 
-    parse_provider_state(&stdout, port).map_err(|()| SERVE_STATUS_ERROR.to_owned())
+    parse_provider_states(&stdout, ports).map_err(|()| SERVE_STATUS_ERROR.to_owned())
+}
+
+pub(crate) fn inspect_client_prerequisites() -> Result<(), String> {
+    current_node_dns_name().map(|_| ())
 }
 
 fn current_node_endpoint(port: u16) -> Result<String, String> {
+    let dns_name = current_node_dns_name()?;
+
+    Ok(format!("tcp://{dns_name}:{port}"))
+}
+
+fn current_node_dns_name() -> Result<String, String> {
     let output = match Command::new(TAILSCALE_EXECUTABLE)
         .args(["status", "--json"])
         .output()
@@ -140,7 +157,7 @@ fn current_node_endpoint(port: u16) -> Result<String, String> {
         .filter(|dns_name| dns_name_is_valid(dns_name))
         .ok_or_else(|| ENDPOINT_ERROR.to_owned())?;
 
-    Ok(format!("tcp://{dns_name}:{port}"))
+    Ok(dns_name.to_owned())
 }
 
 fn dns_name_is_valid(dns_name: &str) -> bool {
@@ -183,15 +200,27 @@ fn serve_status_stdout() -> Result<Vec<u8>, String> {
 }
 
 fn parse_provider_state(stdout: &[u8], port: u16) -> Result<ProviderState, ()> {
+    parse_provider_states(stdout, &[port])?
+        .into_iter()
+        .next()
+        .ok_or(())
+}
+
+fn parse_provider_states(stdout: &[u8], ports: &[u16]) -> Result<Vec<ProviderState>, ()> {
     serde_json::from_slice::<Value>(stdout).map_err(|_| ())?;
 
     let config: Option<ServeConfig> = match serde_json::from_slice(stdout) {
         Ok(config) => config,
-        Err(_) => return Ok(ProviderState::Indeterminate),
+        Err(_) => {
+            return Ok(ports.iter().map(|_| ProviderState::Indeterminate).collect());
+        }
     };
 
     let config = config.unwrap_or_default();
-    Ok(classify_provider_state(&config, port))
+    Ok(ports
+        .iter()
+        .map(|port| classify_provider_state(&config, *port))
+        .collect())
 }
 
 fn classify_provider_state(config: &ServeConfig, port: u16) -> ProviderState {

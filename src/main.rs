@@ -51,6 +51,41 @@ struct Publication {
     publisher: String,
 }
 
+struct DoctorReport {
+    blocking_failures: usize,
+}
+
+impl DoctorReport {
+    fn new() -> Self {
+        Self {
+            blocking_failures: 0,
+        }
+    }
+
+    fn pass(&self, message: impl std::fmt::Display) {
+        println!("PASS  {message}");
+    }
+
+    fn fail(&mut self, message: impl std::fmt::Display) {
+        println!("FAIL  {message}");
+        self.blocking_failures += 1;
+    }
+
+    fn info(&self, message: impl std::fmt::Display) {
+        println!("INFO  {message}");
+    }
+
+    fn finish(self) -> ExitCode {
+        if self.blocking_failures == 0 {
+            println!("No blocking readiness issues detected by performed checks");
+            ExitCode::SUCCESS
+        } else {
+            println!("Found {} blocking readiness issues", self.blocking_failures);
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -62,6 +97,7 @@ fn main() -> ExitCode {
         [command] if command == "init" => init(),
         [command] if command == "validate" => validate(),
         [command] if command == "validate-publishing" => validate_publishing(),
+        [command] if command == "doctor" => doctor(),
         [command] if command == "apply" => apply(),
         [command, service, publisher] if command == "publish" => publish(service, publisher),
         [command, service, publisher] if command == "status" => status(service, publisher),
@@ -124,6 +160,252 @@ fn validate_publishing() -> ExitCode {
 
     println!("aequimuta.publish.toml is valid");
     ExitCode::SUCCESS
+}
+
+fn doctor() -> ExitCode {
+    let mut report = DoctorReport::new();
+    println!("Project");
+
+    let declaration = match load_declaration() {
+        Ok(declaration) => {
+            report.pass(DECLARATION_PATH);
+            declaration
+        }
+        Err(error) => {
+            report.fail(format!(
+                "{DECLARATION_PATH}: {}",
+                diagnostic_error_detail(error)
+            ));
+            return report.finish();
+        }
+    };
+
+    let publishing_intent = match load_publishing_intent(&declaration) {
+        Ok(publishing_intent) => {
+            report.pass(PUBLISHING_PATH);
+            publishing_intent
+        }
+        Err(error) => {
+            report.fail(format!(
+                "{PUBLISHING_PATH}: {}",
+                diagnostic_error_detail(error)
+            ));
+            return report.finish();
+        }
+    };
+
+    if publishing_intent.publications.is_empty() {
+        report.info("No desired publications to check");
+        return report.finish();
+    }
+
+    report.info(format!(
+        "Desired publications: {}",
+        publishing_intent.publications.len()
+    ));
+
+    let mut unsupported_publishers = Vec::new();
+    let mut seen_unsupported_publishers = HashSet::new();
+
+    for publication in &publishing_intent.publications {
+        if !publisher_is_operationally_supported(&publication.publisher)
+            && seen_unsupported_publishers.insert(publication.publisher.as_str())
+        {
+            unsupported_publishers.push(publication.publisher.as_str());
+        }
+    }
+
+    if unsupported_publishers.is_empty() {
+        report.pass("Operational publisher support");
+    } else {
+        report.fail(format!(
+            "Operational publisher support: unsupported desired publisher tokens: {}",
+            unsupported_publishers.join(", ")
+        ));
+    }
+
+    let desired_tailscale: Vec<(&str, u16)> = publishing_intent
+        .publications
+        .iter()
+        .filter(|publication| publication.publisher == TAILSCALE_SERVE_TCP_PUBLISHER)
+        .filter_map(|publication| {
+            declaration
+                .services
+                .iter()
+                .find(|service| service.name == publication.service)
+                .map(|service| (publication.service.as_str(), service.port))
+        })
+        .collect();
+    let tailscale_slots_are_ambiguous = !desired_tailscale.is_empty()
+        && tailscale_serve_tcp_publications_are_ambiguous(&declaration, &publishing_intent);
+
+    if !desired_tailscale.is_empty() {
+        if tailscale_slots_are_ambiguous {
+            report.fail(
+                "Tailscale desired-slot rules: multiple publications target the same current-node TCP port",
+            );
+        } else {
+            report.pass("Tailscale desired-slot rules");
+        }
+    }
+
+    let services_by_name: HashMap<&str, &Service> = declaration
+        .services
+        .iter()
+        .map(|service| (service.name.as_str(), service))
+        .collect();
+    let mut checked_backends = HashSet::new();
+    println!("Local backends");
+
+    for publication in &publishing_intent.publications {
+        let Some(service) = services_by_name.get(publication.service.as_str()) else {
+            continue;
+        };
+
+        if !checked_backends.insert(service.port) {
+            continue;
+        }
+
+        let address = format!("127.0.0.1:{}", service.port);
+        if local_tcp_backend::ensure_reachable(service.port).is_ok() {
+            report.pass(format!("{} {address}", service.name));
+        } else {
+            report.fail(format!("{} {address} is not reachable", service.name));
+        }
+    }
+
+    if !desired_tailscale.is_empty() && !tailscale_slots_are_ambiguous {
+        println!("Tailscale");
+
+        match tailscale_serve_tcp::inspect_client_prerequisites() {
+            Ok(()) => {
+                report.pass("Client state permits endpoint resolution");
+                let ports: Vec<u16> = desired_tailscale.iter().map(|(_, port)| *port).collect();
+
+                match tailscale_serve_tcp::observe_ports(&ports) {
+                    Ok(states) => {
+                        for ((service, _), state) in desired_tailscale.iter().zip(states) {
+                            match state {
+                                tailscale_serve_tcp::ProviderState::Absent
+                                | tailscale_serve_tcp::ProviderState::AlreadySatisfied => report
+                                    .pass(format!("{service} Serve slot permits apply")),
+                                tailscale_serve_tcp::ProviderState::Conflict => report.fail(
+                                    format!(
+                                        "{service} Serve slot is blocked by incompatible existing state"
+                                    ),
+                                ),
+                                tailscale_serve_tcp::ProviderState::Indeterminate => report.fail(
+                                    format!("{service} Serve slot cannot be classified safely"),
+                                ),
+                            }
+                        }
+                    }
+                    Err(error) => report.fail(format!(
+                        "Serve state observation: {}",
+                        diagnostic_error_detail(&error)
+                    )),
+                }
+            }
+            Err(error) => report.fail(format!(
+                "Tailscale client prerequisites: {}",
+                diagnostic_error_detail(&error)
+            )),
+        }
+    }
+
+    let desired_openssh_services: Vec<&str> = publishing_intent
+        .publications
+        .iter()
+        .filter(|publication| publication.publisher == OPENSSH_REVERSE_TCP_PUBLISHER)
+        .map(|publication| publication.service.as_str())
+        .collect();
+
+    if !desired_openssh_services.is_empty() {
+        println!("OpenSSH");
+        let declared_services: Vec<&str> = declaration
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect();
+
+        match openssh_reverse_tcp::load_and_resolve_desired(
+            &declared_services,
+            &desired_openssh_services,
+        ) {
+            Ok(publications) => {
+                report.pass("Provider configuration and desired-slot rules");
+
+                match openssh_reverse_tcp::inspect_runtime() {
+                    Ok(runtime) => {
+                        report.pass("Runtime path has no unsafe existing entry");
+
+                        for service in &desired_openssh_services {
+                            let publication = match publications.get(service) {
+                                Ok(publication) => publication,
+                                Err(error) => {
+                                    report.fail(format!(
+                                        "{service} provider configuration: {}",
+                                        diagnostic_error_detail(&error)
+                                    ));
+                                    continue;
+                                }
+                            };
+
+                            match openssh_reverse_tcp::inspect_control_path(&runtime, publication) {
+                                Ok(control_path) => {
+                                    report.pass(format!(
+                                        "{service} ssh executable and control-path resolution"
+                                    ));
+
+                                    match openssh_reverse_tcp::inspect_existing_master(
+                                        &runtime,
+                                        &control_path,
+                                        publication,
+                                    ) {
+                                        Ok(openssh_reverse_tcp::ExistingMaster::Absent) => report
+                                            .pass(format!(
+                                                "{service} local control state: no existing master"
+                                            )),
+                                        Ok(openssh_reverse_tcp::ExistingMaster::Responding) => {
+                                            report.pass(format!(
+                                                "{service} local control state: existing master responds"
+                                            ));
+                                        }
+                                        Err(error) => report.fail(format!(
+                                            "{service} local control state: {}",
+                                            diagnostic_error_detail(&error)
+                                        )),
+                                    }
+                                }
+                                Err(error) => report.fail(format!(
+                                    "{service} ssh executable and control-path resolution: {}",
+                                    diagnostic_error_detail(&error)
+                                )),
+                            }
+                        }
+                    }
+                    Err(error) => report.fail(format!(
+                        "Runtime path inspection: {}",
+                        diagnostic_error_detail(&error)
+                    )),
+                }
+            }
+            Err(error) => report.fail(format!(
+                "Provider configuration and desired-slot rules: {}",
+                diagnostic_error_detail(&error)
+            )),
+        }
+
+        report.info(
+            "OpenSSH remote reachability, host-key trust, credentials, authentication, forwarding policy, and listener availability were not probed",
+        );
+    }
+
+    report.finish()
+}
+
+fn diagnostic_error_detail(error: &str) -> &str {
+    error.strip_prefix("error: ").unwrap_or(error)
 }
 
 fn publish(service_name: &str, publisher: &str) -> ExitCode {

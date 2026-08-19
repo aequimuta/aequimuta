@@ -132,10 +132,62 @@ aequimuta validate-publishing
 ```
 
 The second command does not validate the OpenSSH-specific file. That file is
-validated by an individual OpenSSH publish, or during project-wide preflight
-when `apply` finds at least one desired OpenSSH publication.
+validated by an individual OpenSSH publish, by `doctor`, or during
+project-wide preflight when `apply` finds at least one desired OpenSSH
+publication.
 
-## 6. Apply all desired publications once
+## 6. Diagnose current readiness
+
+The recommended project workflow before mutation is:
+
+```sh
+aequimuta validate
+aequimuta validate-publishing
+aequimuta doctor
+aequimuta apply
+```
+
+Run the diagnostic step now:
+
+```sh
+aequimuta doctor
+```
+
+Doctor checks the project, desired-publication applicability, the unique local
+backend, Tailscale client and Serve state, and OpenSSH provider configuration
+and existing local runtime/control state. It does not create a missing OpenSSH
+runtime child or master. When the selected Tailscale slot permits apply and no
+OpenSSH master exists, output has this shape:
+
+```text
+Project
+PASS  aequimuta.toml
+PASS  aequimuta.publish.toml
+INFO  Desired publications: 2
+PASS  Operational publisher support
+PASS  Tailscale desired-slot rules
+Local backends
+PASS  web 127.0.0.1:8080
+Tailscale
+PASS  Client state permits endpoint resolution
+PASS  web Serve slot permits apply
+OpenSSH
+PASS  Provider configuration and desired-slot rules
+PASS  Runtime path has no unsafe existing entry
+PASS  web ssh executable and control-path resolution
+PASS  web local control state: no existing master
+INFO  OpenSSH remote reachability, host-key trust, credentials, authentication, forwarding policy, and listener availability were not probed
+No blocking readiness issues detected by performed checks
+```
+
+An existing safe, responding master changes only the local-control-state line.
+The local TCP connect and daemon/socket queries are active observations, but
+doctor does not change project or provider configuration. Its OpenSSH `INFO`
+line is an explicit boundary: remote authentication, policy, and listener
+conditions remain for the actual apply operation. State can also change after
+the checks, so exit `0` does not guarantee that apply will succeed.
+
+## 7. Apply all desired publications once
 
 Run the zero-argument project-wide operation:
 
@@ -168,7 +220,7 @@ A valid publishing intent with zero entries is also successful and prints only
 `apply` stops before later entries and omits the final summary. Earlier
 successful effects are not rolled back.
 
-## 7. Publish through Tailscale individually
+## 8. Publish through Tailscale individually
 
 The exact individual operation remains available:
 
@@ -176,7 +228,7 @@ The exact individual operation remains available:
 aequimuta publish web tailscale-serve-tcp
 ```
 
-If this command is used instead of Step 6 with an absent selected slot, its
+If this command is used instead of Step 7 with an absent selected slot, its
 Created output has this shape:
 
 ```text
@@ -201,7 +253,7 @@ curl http://<tailscale-dns-name>:8080/
 This check depends on the client being able to resolve and reach the tailnet
 endpoint.
 
-## 8. Observe Tailscale status
+## 9. Observe Tailscale status
 
 Run:
 
@@ -219,7 +271,7 @@ This observes the provider mapping only. Stop the Python backend and the mapping
 can still be `satisfied`; status is not a local health check. Restart the backend
 before continuing because both publish paths preflight local TCP connectivity.
 
-## 9. Publish through OpenSSH individually
+## 10. Publish through OpenSSH individually
 
 The exact individual operation also remains available. With the configured
 remote server ready, run:
@@ -238,7 +290,7 @@ This means the current background SSH session received acknowledgement for the
 requested forwarding. It does not mean the listener is publicly reachable or
 that the server preserved the requested bind address exactly.
 
-## 10. Verify the OpenSSH TCP data path
+## 11. Verify the OpenSSH TCP data path
 
 From a location that remote SSH policy, routing, and firewall rules allow to
 reach the listener, request the demo backend through the remote address:
@@ -251,7 +303,7 @@ Choose `<reachable-remote-address>` from observed server and network behavior,
 not merely from `listen_address`. A request for `0.0.0.0` does not configure DNS,
 open a firewall, traverse NAT, or guarantee Internet reachability.
 
-## 11. Repeat apply
+## 12. Repeat apply
 
 Run the same project-wide operation again:
 
@@ -307,7 +359,10 @@ the mechanism remains concrete.
 - It does not treat unknown provider state as absent.
 - The Tailscale create path verifies its post-condition.
 - The OpenSSH path waits for forwarding acknowledgement.
-- Project TOML files are not modified by `publish`, `status`, or `apply`.
+- Project TOML files are not modified by `doctor`, `publish`, `status`, or
+  `apply`.
+- `doctor` does not prepare missing OpenSSH runtime directories or probe remote
+  authentication, forwarding policy, or listener availability.
 - Neither path provides an absolute transaction or concurrent-writer guarantee.
 - A failed `apply` does not roll back earlier successes or execute later
   entries.

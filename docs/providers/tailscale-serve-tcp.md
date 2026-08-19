@@ -104,6 +104,33 @@ Publication already satisfied for web via tailscale-serve-tcp at tcp://<tailscal
 Aequimuta does not claim that it created or owns a mapping found at invocation
 time.
 
+## Doctor
+
+Project-wide readiness diagnostics include the Tailscale branch only when at
+least one desired publication uses this capability:
+
+```sh
+aequimuta doctor
+```
+
+For one doctor invocation, Aequimuta queries `tailscale status --json` at most
+once for the existing client and endpoint-derivation prerequisites, then
+queries `tailscale serve status --json` at most once and reuses that structured
+snapshot for all desired Tailscale ports. It does not issue a Serve or Funnel
+mutation.
+
+The existing concrete classifier is projected into readiness results: an
+absent or exactly satisfied slot is `PASS`, while a conflicting or
+indeterminate slot is fail-closed `FAIL`. Doctor displays only the performed
+check result; use `status <service> tailscale-serve-tcp` when the exact
+four-state relation is needed.
+
+Doctor also performs the project-wide local TCP connect for each unique desired
+backend. These TCP and daemon observations can be visible to the application or
+provider environment even though the command does not change durable project
+or provider configuration. A successful diagnostic does not guarantee a later
+apply because state can change after observation.
+
 ## Status
 
 Observe the selected desired relation without provider mutation:

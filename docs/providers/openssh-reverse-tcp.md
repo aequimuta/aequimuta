@@ -213,6 +213,35 @@ dedicated master may already have been established before the forwarding
 request is rejected; the operation is not presented as a transaction that
 leaves no runtime state after every failure.
 
+## Doctor
+
+When at least one desired publication uses this capability, project-wide
+non-mutating readiness diagnostics check only the currently observable local
+boundary:
+
+```sh
+aequimuta doctor
+```
+
+The OpenSSH section validates and resolves the provider configuration, inspects
+the existing XDG and provider child entries, derives each expected control path
+with `ssh -G`, and inspects the expected entry metadata. A missing provider
+child is not created. That absence can pass the existing-entry check, but it
+does not prove that a later apply will be able to create the directory.
+
+Only an expected path that is already a safe, private Unix socket is queried
+with `ssh -O check`. A successful check means that the existing master responds;
+it does not establish that an exact remote forward exists. A stale socket or
+unsafe entry is reported and preserved without unlink, permission repair,
+master creation, forwarding, cancellation, exit, or process cleanup.
+
+OpenSSH remote reachability, host-key trust, credentials, authentication,
+forwarding policy, and listener availability are deliberately not probed.
+Doctor reports that boundary as `INFO`, not `PASS`. The local TCP, `ssh -G`, and
+safe control-socket observations can produce network, IPC, application, or log
+activity even though project/provider configuration and runtime entries are not
+mutated. Consequently, doctor success does not guarantee a later apply.
+
 ## Status support
 
 The following command is currently unsupported:

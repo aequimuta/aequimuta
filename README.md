@@ -101,9 +101,10 @@ aequimuta version
 aequimuta init
 aequimuta validate
 aequimuta validate-publishing
+aequimuta doctor
 aequimuta publish <service> <publisher>
-aequimuta status <service> <publisher>
 aequimuta apply
+aequimuta status <service> <publisher>
 ```
 
 `status` currently supports only `tailscale-serve-tcp`. OpenSSH publication has
@@ -184,6 +185,37 @@ Individual operations validate the selected concrete path when they run.
 `apply` performs operational and provider-specific project preflight for every
 desired publication before beginning provider mutation.
 
+### Diagnose readiness before apply
+
+Run project-wide non-mutating readiness diagnostics:
+
+```sh
+aequimuta doctor
+```
+
+`doctor` checks the project and desired-publication applicability, connects
+once to each unique desired `127.0.0.1:<service.port>` backend, and observes
+the applicable concrete provider prerequisites. The TCP connects are active
+observations; they send no application-protocol data, but they can be visible
+to the local application. Tailscale diagnostics query the client and structured
+Serve state. OpenSSH diagnostics inspect its project configuration and existing
+local XDG runtime/control state, use `ssh -G`, and issue `ssh -O check` only for
+a safe existing control socket.
+
+The command does not change project or provider configuration and does not
+prepare missing OpenSSH runtime directories. Its daemon, socket, and TCP
+observations can still produce network, IPC, application, or daemon-log
+activity. OpenSSH remote reachability, host-key trust, credentials,
+authentication, forwarding policy, and listener availability are intentionally
+not probed.
+
+Performed checks use `PASS` or `FAIL`; `INFO` supplies scope notes. Exit `0`
+means no blocking readiness issue was detected by the performed checks, exit
+`1` means at least one blocking issue was found, and invalid command usage exits
+`2`. A successful `doctor` run does not guarantee a later `apply`: state can
+change after observation, and the listed OpenSSH remote conditions were not
+probed.
+
 ### Publish with Tailscale
 
 With a running local backend and a suitable local Tailscale environment:
@@ -225,8 +257,8 @@ project files.
 
 ### Apply all desired publications once
 
-With every desired backend and provider prerequisite ready, run the
-zero-argument project-wide command:
+After reviewing the current `doctor` diagnostics, run the zero-argument
+project-wide command:
 
 ```sh
 aequimuta apply
@@ -301,7 +333,8 @@ The current safety boundaries include:
 - Tailscale post-condition verification after creation
 - OpenSSH server acknowledgement before an `Ensured` result
 - no broad provider reset or automatic takeover
-- no modification of project TOML files by `publish`, `status`, or `apply`
+- no modification of project TOML files by `doctor`, `publish`, `status`, or
+  `apply`
 - no secret fields in the Git-trackable OpenSSH provider configuration
 
 These boundaries are not an absolute transaction or concurrency guarantee.
@@ -320,6 +353,8 @@ ownership record or authoritative remote snapshot.
 - no durable ownership database
 - OpenSSH has no authoritative status, automatic reconnect, or reboot
   persistence
+- doctor does not probe OpenSSH remote authentication, forwarding policy, or
+  listener availability, and does not guarantee future apply success
 - no generic Publisher plugin API
 - no third publisher
 - no HTTP, HTTPS, or UDP publishing capability

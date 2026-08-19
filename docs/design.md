@@ -150,6 +150,66 @@ to the local Tailscale environment rather than to an Aequimuta process.
 These runtime effects differ because the providers differ. No hidden runtime
 state database is used to make them appear identical.
 
+## Project-wide non-mutating readiness diagnostics
+
+The current project workflow separates declaration, validation, diagnostics,
+mutation, and observation:
+
+```text
+Declare
+  |
+  v
+Validate
+  |
+  v
+Doctor
+  |
+  v
+Apply
+  |
+  v
+Observe
+```
+
+`aequimuta doctor` takes no arguments. It reports current blocking readiness
+issues that can be diagnosed without changing project or provider
+configuration. Its explicit command-layer flow validates the two core project
+files, checks operational publisher support and concrete desired-slot rules,
+connects once to each unique desired local TCP backend, and then runs only the
+applicable Tailscale and OpenSSH observations. Independent branch failures are
+aggregated when their prerequisites remain available; dependent checks are not
+forced after their input model is unavailable.
+
+Performed checks use `PASS` or `FAIL`, while `INFO` records counts and deliberate
+scope boundaries. A run with no blocking result ends with
+`No blocking readiness issues detected by performed checks`. These labels are
+local diagnostic results, not a provider status algebra or a claim that a
+future operation will succeed.
+
+The Tailscale branch reads the current client state needed for endpoint
+derivation and one structured Serve snapshot. It reuses the existing concrete
+slot classifier: an absent or exactly satisfied slot permits apply and is a
+doctor `PASS`; a conflicting or indeterminate slot is fail-closed `FAIL`.
+`status <service> tailscale-serve-tcp` remains the command that exposes the
+exact four-state relation.
+
+The OpenSSH branch validates and resolves its concrete provider configuration,
+inspects existing XDG runtime entries without creating missing child
+directories, derives each expected control path with `ssh -G`, and uses
+`ssh -O check` only for a safe existing Unix control socket. That control
+operation observes master liveness only. It is not a snapshot of the exact
+remote forward. Remote reachability, host-key trust, credentials,
+authentication, forwarding policy, and listener availability are deliberately
+not probed.
+
+Non-mutating describes the durable configuration and runtime-state boundary,
+not an absence of observable activity. Local TCP connects, Tailscale daemon
+queries, and OpenSSH control-socket queries can produce network, IPC,
+application, or daemon-log activity. Time-of-check changes and the unprobed
+OpenSSH remote conditions prevent `doctor` from guaranteeing a later `apply`.
+No generic Doctor trait, provider registry, or universal readiness model is
+introduced by this command.
+
 ## Project-wide one-shot apply
 
 `aequimuta apply` takes no arguments. It processes the current entries in
@@ -219,14 +279,21 @@ Likewise, the Tailscale four-state relation is not presented as an OpenSSH
 status model. Different visibility and lifetime semantics are part of the
 public behavior, not details to hide behind a common label.
 
-## Desired state and observed state
+## Desired state, readiness, and observed state
 
-The current CLI distinguishes three concepts:
+The current CLI distinguishes four concepts:
 
 1. `aequimuta.toml` describes the desired local service identity and port.
 2. `aequimuta.publish.toml` describes desired exact publication relations.
-3. Tailscale `status` observes one selected relation between that intent and a
+3. `doctor` diagnoses current project-wide blocking readiness conditions that
+   can be checked without provider mutation.
+4. Tailscale `status` observes one selected relation between that intent and a
    concrete Serve mapping.
+
+Doctor readiness and exact provider status are different responsibilities.
+Doctor projects applicable concrete observations into performed-check
+`PASS`/`FAIL` results and explicitly records the OpenSSH remote non-probe. It
+does not turn those results into a cross-provider observed-state model.
 
 For `tailscale-serve-tcp`, the observed relation is one of `absent`,
 `satisfied`, `conflict`, or `indeterminate`. This relation says nothing about
@@ -256,7 +323,7 @@ The current safety model is based on exact identity and refusal:
 - require OpenSSH forwarding acknowledgement before success
 - avoid broad reset, cleanup, takeover, or false ownership claims
 - preserve project TOML bytes and project directory entries during `publish`,
-  `status`, and `apply`
+  `status`, `doctor`, and `apply`
 
 Tailscale state can still change between Aequimuta's observation and provider
 mutation. The current implementation assumes a single writer during that
@@ -268,9 +335,10 @@ remote ownership.
 
 ## Why there is no generic Publisher abstraction yet
 
-The current code has two concrete mechanisms and no generic Publisher trait,
-registry, plugin loader, or shared result algebra. This is deliberate, but not
-an unconditional rejection of abstraction.
+The current code has two concrete mechanisms and no generic Publisher or
+Doctor trait, registry, plugin loader, or shared provider readiness/result
+algebra. This is deliberate, but not an unconditional rejection of
+abstraction.
 
 Implementing the concrete paths first reveals which behavior is actually
 shared and which remains mechanism-specific. The current differences include:
@@ -329,6 +397,8 @@ The current design does not provide:
 - there is no unpublish or delete command
 - there is no durable ownership or runtime database
 - status exists only for Tailscale Serve TCP
+- doctor does not probe OpenSSH remote authentication, forwarding policy, or
+  listener availability and cannot guarantee a later apply
 - OpenSSH publication has no reconnect, retry, supervision, or reboot recovery
 - no third publisher is implemented
 

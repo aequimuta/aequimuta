@@ -66,6 +66,20 @@ pub(crate) struct ResolvedPublications {
     active: Vec<ProviderPublication>,
 }
 
+pub(crate) struct InspectedRuntime {
+    current_uid: u32,
+    provider_directory: PathBuf,
+}
+
+pub(crate) struct InspectedControlPath {
+    path: PathBuf,
+}
+
+pub(crate) enum ExistingMaster {
+    Absent,
+    Responding,
+}
+
 impl ResolvedPublications {
     pub(crate) fn get(&self, service: &str) -> Result<&ProviderPublication, String> {
         self.active
@@ -138,6 +152,54 @@ pub(crate) fn preflight_runtime() -> Result<(), String> {
     let current_uid = current_uid()?;
     prepare_runtime_directory(current_uid)?;
     Ok(())
+}
+
+pub(crate) fn inspect_runtime() -> Result<InspectedRuntime, String> {
+    let current_uid = current_uid()?;
+    let xdg_runtime_directory = validated_xdg_runtime_directory(current_uid)?;
+    let aequimuta_directory = xdg_runtime_directory.join("aequimuta");
+    let provider_directory = aequimuta_directory.join("openssh-reverse-tcp");
+
+    if inspect_private_directory(&aequimuta_directory, current_uid)? {
+        inspect_private_directory(&provider_directory, current_uid)?;
+    }
+
+    Ok(InspectedRuntime {
+        current_uid,
+        provider_directory,
+    })
+}
+
+pub(crate) fn inspect_control_path(
+    runtime: &InspectedRuntime,
+    publication: &ProviderPublication,
+) -> Result<InspectedControlPath, String> {
+    let control_path_template = runtime.provider_directory.join("cm-%C");
+    let mut command = control_path_expansion_command(&control_path_template, publication);
+    let output = run_ssh_observation(&mut command, CONTROL_PATH_ERROR)?;
+    let path = validated_control_path(&control_path_template, publication, &output)?;
+
+    Ok(InspectedControlPath { path })
+}
+
+pub(crate) fn inspect_existing_master(
+    runtime: &InspectedRuntime,
+    control_path: &InspectedControlPath,
+    publication: &ProviderPublication,
+) -> Result<ExistingMaster, String> {
+    match fs::symlink_metadata(&control_path.path) {
+        Ok(metadata) => validate_control_socket(&metadata, runtime.current_uid)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ExistingMaster::Absent);
+        }
+        Err(_) => return Err(STALE_CONTROL_SOCKET_ERROR.to_owned()),
+    }
+
+    let mut command = master_check_command(&control_path.path, publication);
+    let output = run_ssh_observation(&mut command, STALE_CONTROL_SOCKET_ERROR)?;
+    validated_master_pid(&output, STALE_CONTROL_SOCKET_ERROR)?;
+
+    Ok(ExistingMaster::Responding)
 }
 
 pub(crate) fn ensure(local_port: u16, publication: &ProviderPublication) -> Result<(), String> {
@@ -227,6 +289,16 @@ fn current_uid() -> Result<u32, String> {
 }
 
 fn prepare_runtime_directory(current_uid: u32) -> Result<PathBuf, String> {
+    let xdg_runtime_directory = validated_xdg_runtime_directory(current_uid)?;
+    let aequimuta_directory = xdg_runtime_directory.join("aequimuta");
+    ensure_private_directory(&aequimuta_directory, current_uid)?;
+    let provider_directory = aequimuta_directory.join("openssh-reverse-tcp");
+    ensure_private_directory(&provider_directory, current_uid)?;
+
+    Ok(provider_directory)
+}
+
+fn validated_xdg_runtime_directory(current_uid: u32) -> Result<PathBuf, String> {
     let xdg_runtime_directory =
         env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| RUNTIME_DIRECTORY_ERROR.to_owned())?;
     let xdg_runtime_directory = PathBuf::from(xdg_runtime_directory);
@@ -236,12 +308,18 @@ fn prepare_runtime_directory(current_uid: u32) -> Result<PathBuf, String> {
     }
 
     validate_private_directory(&xdg_runtime_directory, current_uid)?;
-    let aequimuta_directory = xdg_runtime_directory.join("aequimuta");
-    ensure_private_directory(&aequimuta_directory, current_uid)?;
-    let provider_directory = aequimuta_directory.join("openssh-reverse-tcp");
-    ensure_private_directory(&provider_directory, current_uid)?;
+    Ok(xdg_runtime_directory)
+}
 
-    Ok(provider_directory)
+fn inspect_private_directory(path: &Path, current_uid: u32) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_private_directory(path, current_uid)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(RUNTIME_DIRECTORY_ERROR.to_owned()),
+    }
 }
 
 fn ensure_private_directory(path: &Path, current_uid: u32) -> Result<(), String> {
@@ -278,6 +356,16 @@ fn expand_control_path(
     control_path_template: &Path,
     publication: &ProviderPublication,
 ) -> Result<PathBuf, String> {
+    let mut command = control_path_expansion_command(control_path_template, publication);
+    let output = run_ssh(&mut command, SSH_CONFIGURATION_TIMEOUT, CONTROL_PATH_ERROR)?;
+
+    validated_control_path(control_path_template, publication, &output)
+}
+
+fn control_path_expansion_command(
+    control_path_template: &Path,
+    publication: &ProviderPublication,
+) -> Command {
     let mut command = Command::new(SSH_EXECUTABLE);
     command
         .arg("-G")
@@ -299,8 +387,14 @@ fn expand_control_path(
         .arg("-o")
         .arg("ProxyJump=none")
         .arg(&publication.host);
-    let output = run_ssh(&mut command, SSH_CONFIGURATION_TIMEOUT, CONTROL_PATH_ERROR)?;
+    command
+}
 
+fn validated_control_path(
+    control_path_template: &Path,
+    publication: &ProviderPublication,
+    output: &Output,
+) -> Result<PathBuf, String> {
     if !output.status.success() {
         return Err(CONTROL_PATH_ERROR.to_owned());
     }
@@ -388,14 +482,23 @@ fn live_master_pid(
     publication: &ProviderPublication,
     error_message: &str,
 ) -> Result<u32, String> {
+    let mut command = master_check_command(control_path, publication);
+    let output = run_ssh(&mut command, SSH_CONTROL_CHECK_TIMEOUT, error_message)?;
+
+    validated_master_pid(&output, error_message)
+}
+
+fn master_check_command(control_path: &Path, publication: &ProviderPublication) -> Command {
     let mut command = isolated_control_command(control_path, publication);
     command
         .arg("-O")
         .arg("check")
         .arg(&publication.host)
         .env("LC_ALL", "C");
-    let output = run_ssh(&mut command, SSH_CONTROL_CHECK_TIMEOUT, error_message)?;
+    command
+}
 
+fn validated_master_pid(output: &Output, error_message: &str) -> Result<u32, String> {
     if !output.status.success() || !output.stdout.is_empty() {
         return Err(error_message.to_owned());
     }
@@ -661,6 +764,21 @@ fn run_ssh(
         }
 
         thread::sleep(SSH_COMMAND_POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn run_ssh_observation(command: &mut Command, error_message: &str) -> Result<Output, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    match command.output() {
+        Ok(output) => Ok(output),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(SSH_EXECUTABLE_ERROR.to_owned())
+        }
+        Err(_) => Err(error_message.to_owned()),
     }
 }
 
