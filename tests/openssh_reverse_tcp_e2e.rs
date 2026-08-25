@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
@@ -6,8 +7,9 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -823,31 +825,53 @@ fn write_validated_sshd_configuration(
         sshd_port,
         success_listener_port,
         conflict_listener_port,
+        false,
     )?;
     let none_validation = validate_sshd_configuration(path)?;
 
-    if none_validation.status.success() {
-        return Ok(());
-    }
+    let pid_file = if none_validation.status.success() {
+        "none".to_owned()
+    } else {
+        let pid_file = root.join("sshd.pid").to_string_lossy().into_owned();
+        write_sshd_configuration(
+            path,
+            &pid_file,
+            host_key,
+            authorized_keys,
+            username,
+            sshd_port,
+            success_listener_port,
+            conflict_listener_port,
+            false,
+        )?;
+        let fallback_validation = validate_sshd_configuration(path)?;
 
-    let pid_file = root.join("sshd.pid");
-    write_sshd_configuration(
-        path,
-        &pid_file.to_string_lossy(),
-        host_key,
-        authorized_keys,
-        username,
-        sshd_port,
-        success_listener_port,
-        conflict_listener_port,
-    )?;
-    let fallback_validation = validate_sshd_configuration(path)?;
+        check(
+            fallback_validation.status.success(),
+            format!(
+                "sshd rejected both `PidFile none` and the fixture-local fallback; none={none_validation:?}, fallback={fallback_validation:?}"
+            ),
+        )?;
+        pid_file
+    };
 
-    check(
-        fallback_validation.status.success(),
-        format!(
-            "sshd rejected both `PidFile none` and the fixture-local fallback; none={none_validation:?}, fallback={fallback_validation:?}"
-        ),
+    // The readiness probe disconnects before authentication, which modern source
+    // penalties can count; keep the override only when this sshd accepts it.
+    configure_per_source_penalties(
+        |include_override| {
+            write_sshd_configuration(
+                path,
+                &pid_file,
+                host_key,
+                authorized_keys,
+                username,
+                sshd_port,
+                success_listener_port,
+                conflict_listener_port,
+                include_override,
+            )
+        },
+        || validate_sshd_configuration(path),
     )
 }
 
@@ -861,7 +885,14 @@ fn write_sshd_configuration(
     sshd_port: u16,
     success_listener_port: u16,
     conflict_listener_port: u16,
+    include_per_source_penalties: bool,
 ) -> io::Result<()> {
+    let per_source_penalties = if include_per_source_penalties {
+        "PerSourcePenalties no\n"
+    } else {
+        ""
+    };
+
     fs::write(
         path,
         format!(
@@ -890,13 +921,39 @@ fn write_sshd_configuration(
              PermitUserRC no\n\
              PermitUserEnvironment no\n\
              MaxSessions 0\n\
-             PerSourcePenalties no\n\
+             {per_source_penalties}\
              PrintMotd no\n\
              PrintLastLog no\n\
              UseDNS no\n\
              LogLevel VERBOSE\n",
             host_key.display(),
             authorized_keys.display()
+        ),
+    )
+}
+
+fn configure_per_source_penalties<W, V>(
+    mut write_configuration: W,
+    mut validate_configuration: V,
+) -> io::Result<()>
+where
+    W: FnMut(bool) -> io::Result<()>,
+    V: FnMut() -> io::Result<Output>,
+{
+    write_configuration(true)?;
+    let with_directive = validate_configuration()?;
+
+    if with_directive.status.success() {
+        return Ok(());
+    }
+
+    write_configuration(false)?;
+    let without_directive = validate_configuration()?;
+
+    check(
+        without_directive.status.success(),
+        format!(
+            "sshd rejected the base fixture configuration after probing `PerSourcePenalties no`; with_directive={with_directive:?}, without_directive={without_directive:?}"
         ),
     )
 }
@@ -1111,6 +1168,68 @@ fn check(condition: bool, message: impl Into<String>) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other(message.into()))
+    }
+}
+
+fn validation_output(success: bool) -> Output {
+    Output {
+        status: ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn per_source_penalties_capability_detection_is_adaptive_and_fail_closed() {
+    for (
+        label,
+        directive_supported,
+        base_valid,
+        expected_success,
+        expected_directive,
+        expected_validations,
+    ) in [
+        ("supported", true, true, true, true, 1),
+        ("unsupported", false, true, true, false, 2),
+        ("unrelated-invalid", false, false, false, false, 2),
+    ] {
+        let directive_enabled = Cell::new(false);
+        let validations = Cell::new(0);
+        let result = configure_per_source_penalties(
+            |enabled| {
+                directive_enabled.set(enabled);
+                Ok(())
+            },
+            || {
+                validations.set(validations.get() + 1);
+                let accepted = base_valid && (!directive_enabled.get() || directive_supported);
+                Ok(validation_output(accepted))
+            },
+        );
+
+        assert_eq!(
+            result.is_ok(),
+            expected_success,
+            "unexpected {label} capability result: {result:?}"
+        );
+        if let Err(error) = &result {
+            assert!(
+                error
+                    .to_string()
+                    .contains("sshd rejected the base fixture configuration"),
+                "unrelated invalid configuration was not reported clearly: {error}"
+            );
+        }
+        assert_eq!(
+            directive_enabled.get(),
+            expected_directive,
+            "unexpected {label} final configuration"
+        );
+        assert_eq!(
+            validations.get(),
+            expected_validations,
+            "unexpected {label} validation count"
+        );
     }
 }
 
