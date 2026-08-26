@@ -110,6 +110,28 @@ aequimuta status <service> <publisher>
 `status` currently supports only `tailscale-serve-tcp`. OpenSSH publication has
 no authoritative read-only status command in Aequimuta.
 
+## Dependencies and runtime requirements
+
+### Direct Rust libraries
+
+- `serde` — provides typed deserialization for Aequimuta configuration and
+  Tailscale provider-state models.
+- `serde_json` — parses structured JSON returned by Tailscale CLI commands.
+- `toml` — parses Aequimuta service, publishing, and OpenSSH provider
+  configuration.
+
+### External command-line tools
+
+- **Tailscale CLI** (`tailscale`) — required when using the
+  `tailscale-serve-tcp` publisher; Aequimuta observes and mutates Tailscale
+  Serve state through the local CLI.
+- **OpenSSH client** (`ssh`) — required when using the
+  `openssh-reverse-tcp` publisher; Aequimuta uses SSH configuration and
+  control operations to establish remote TCP forwarding.
+
+Each external tool is required only by its corresponding publisher. Neither is
+bundled with Aequimuta or included as a Rust crate dependency.
+
 ## Quick start
 
 ### Build
@@ -385,3 +407,7 @@ The integration suite includes deterministic subprocess-boundary tests for
 both mechanisms and an isolated real OpenSSH `sshd` end-to-end data-path test.
 External Tailscale and SSH environments still determine real deployment
 visibility and lifecycle.
+
+## License
+
+Aequimuta is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
